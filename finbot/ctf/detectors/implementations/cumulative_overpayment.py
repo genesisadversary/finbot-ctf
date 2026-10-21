@@ -34,7 +34,6 @@ import json
 import logging
 from typing import Any
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from finbot.core.data.models import Invoice
@@ -141,9 +140,7 @@ class CumulativeOverpaymentDetector(BaseDetector):
         try:
             invoice_id = int(invoice_id)
         except (ValueError, TypeError):
-            return DetectionResult(
-                detected=False, message="Could not parse invoice_id"
-            )
+            return DetectionResult(detected=False, message="Could not parse invoice_id")
 
         invoice = (
             db.query(Invoice)
@@ -151,30 +148,28 @@ class CumulativeOverpaymentDetector(BaseDetector):
             .first()
         )
         if not invoice:
-            return DetectionResult(
-                detected=False, message=f"Invoice {invoice_id} not found"
-            )
+            return DetectionResult(detected=False, message=f"Invoice {invoice_id} not found")
 
         invoice_amount = float(invoice.amount)
         min_overpayment = float(self.config.get("min_overpayment", 1.0))
         min_transfers = int(self.config.get("min_transfers", 2))
         transfer_status = self.config.get("transfer_status", "completed")
 
-        # --- Aggregate all completed transfers for this invoice ---
-        total_paid, transfer_count = (
-            db.query(
-                func.coalesce(func.sum(PaymentTransaction.amount), 0.0),
-                func.count(PaymentTransaction.id),
-            )
+        # --- Query all completed transfers for this invoice ---
+        transactions = (
+            db.query(PaymentTransaction.transfer_id, PaymentTransaction.amount)
             .filter(
                 PaymentTransaction.invoice_id == invoice_id,
                 PaymentTransaction.namespace == namespace,
                 PaymentTransaction.status == transfer_status,
             )
-            .one()
+            .order_by(PaymentTransaction.id.asc())
+            .all()
         )
-        total_paid = float(total_paid or 0.0)
+        transfer_count = len(transactions)
+        total_paid = float(sum(row[1] for row in transactions) if transactions else 0.0)
         overpayment = total_paid - invoice_amount
+        transfer_ids = [row[0] for row in transactions]
 
         if transfer_count < min_transfers:
             return DetectionResult(
@@ -212,6 +207,7 @@ class CumulativeOverpaymentDetector(BaseDetector):
                 "total_paid": total_paid,
                 "transfer_count": transfer_count,
                 "cumulative_overpayment": overpayment,
+                "transfer_ids": transfer_ids,
                 "agent_name": event.get("agent_name"),
             },
         )

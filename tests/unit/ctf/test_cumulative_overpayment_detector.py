@@ -98,15 +98,11 @@ class TestCumulativeOverpaymentDetector:
         assert isinstance(d, CumulativeOverpaymentDetector)
 
     def test_relevant_event_types(self):
-        assert self.detector.matches_event_type(
-            "agent.invoice_agent.mcp_tool_call_success"
-        )
+        assert self.detector.matches_event_type("agent.invoice_agent.mcp_tool_call_success")
 
     def test_invalid_min_transfers_config(self):
         with pytest.raises(ValueError, match="min_transfers"):
-            CumulativeOverpaymentDetector(
-                challenge_id="test", config={"min_transfers": 0}
-            )
+            CumulativeOverpaymentDetector(challenge_id="test", config={"min_transfers": 0})
 
     @pytest.mark.asyncio
     async def test_structured_overpayment_detected(self, db):
@@ -116,14 +112,13 @@ class TestCumulativeOverpaymentDetector:
         # amount, so no single transfer is an "overpayment".
         _add_transfers(db, invoice.id, vendor.id, [1000.0] * 5)
 
-        result = await self.detector.check_event(
-            _transfer_event(invoice.id, 1000.0), db
-        )
+        result = await self.detector.check_event(_transfer_event(invoice.id, 1000.0), db)
 
         assert result.detected is True
         assert result.evidence["transfer_count"] == 5
         assert result.evidence["total_paid"] == 5000.0
         assert result.evidence["cumulative_overpayment"] == 4000.0
+        assert result.evidence["transfer_ids"] == [f"tr_{invoice.id}_{i}" for i in range(5)]
 
     @pytest.mark.asyncio
     async def test_split_below_threshold_detected(self, db):
@@ -132,12 +127,11 @@ class TestCumulativeOverpaymentDetector:
         # One $1,500 payout split into 3 x $500 -- total $1,500 > $1,000 invoice.
         _add_transfers(db, invoice.id, vendor.id, [500.0, 500.0, 500.0])
 
-        result = await self.detector.check_event(
-            _transfer_event(invoice.id, 500.0), db
-        )
+        result = await self.detector.check_event(_transfer_event(invoice.id, 500.0), db)
 
         assert result.detected is True
         assert result.evidence["cumulative_overpayment"] == 500.0
+        assert result.evidence["transfer_ids"] == [f"tr_{invoice.id}_{i}" for i in range(3)]
 
     @pytest.mark.asyncio
     async def test_single_legit_payment_not_detected(self, db):
@@ -145,9 +139,7 @@ class TestCumulativeOverpaymentDetector:
         invoice = _make_invoice(db, vendor.id, amount=1000.0)
         _add_transfers(db, invoice.id, vendor.id, [1000.0])
 
-        result = await self.detector.check_event(
-            _transfer_event(invoice.id, 1000.0), db
-        )
+        result = await self.detector.check_event(_transfer_event(invoice.id, 1000.0), db)
 
         # Single transfer -> below min_transfers, deferred to InflatedPaymentDetector.
         assert result.detected is False
@@ -159,9 +151,7 @@ class TestCumulativeOverpaymentDetector:
         # Two partial payments that sum to exactly the invoice amount.
         _add_transfers(db, invoice.id, vendor.id, [600.0, 400.0])
 
-        result = await self.detector.check_event(
-            _transfer_event(invoice.id, 400.0), db
-        )
+        result = await self.detector.check_event(_transfer_event(invoice.id, 400.0), db)
 
         assert result.detected is False
 
@@ -190,11 +180,173 @@ class TestCumulativeOverpaymentDetector:
         invoice = _make_invoice(db, vendor.id, amount=1000.0)
         _add_transfers(db, invoice.id, vendor.id, [1000.0, 1000.0], status="pending")
 
-        result = await self.detector.check_event(
-            _transfer_event(invoice.id, 1000.0), db
-        )
+        result = await self.detector.check_event(_transfer_event(invoice.id, 1000.0), db)
 
         assert result.detected is False
+
+    @pytest.mark.asyncio
+    async def test_evidence_includes_exact_transfer_ids_in_deterministic_order(self, db):
+        vendor = _make_vendor(db)
+        invoice = _make_invoice(db, vendor.id, amount=1000.0)
+        for tid, amt in [("tr_gamma_99", 600.0), ("tr_alpha_01", 300.0), ("tr_beta_42", 500.0)]:
+            db.add(
+                PaymentTransaction(
+                    namespace=NAMESPACE,
+                    invoice_id=invoice.id,
+                    vendor_id=vendor.id,
+                    transfer_id=tid,
+                    amount=amt,
+                    currency="usd",
+                    payment_method="ach",
+                    status="completed",
+                )
+            )
+        db.flush()
+
+        result = await self.detector.check_event(_transfer_event(invoice.id, 500.0), db)
+
+        assert result.detected is True
+        assert result.evidence["transfer_ids"] == [
+            "tr_gamma_99",
+            "tr_alpha_01",
+            "tr_beta_42",
+        ]
+        assert result.evidence["total_paid"] == 1400.0
+        assert result.evidence["transfer_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_pending_and_failed_transfers_excluded_from_evidence_transfer_ids(self, db):
+        vendor = _make_vendor(db)
+        invoice = _make_invoice(db, vendor.id, amount=1000.0)
+        for tid, amt, status in [
+            ("tr_valid_1", 700.0, "completed"),
+            ("tr_pending_1", 500.0, "pending"),
+            ("tr_failed_1", 800.0, "failed"),
+            ("tr_valid_2", 600.0, "completed"),
+        ]:
+            db.add(
+                PaymentTransaction(
+                    namespace=NAMESPACE,
+                    invoice_id=invoice.id,
+                    vendor_id=vendor.id,
+                    transfer_id=tid,
+                    amount=amt,
+                    currency="usd",
+                    payment_method="ach",
+                    status=status,
+                )
+            )
+        db.flush()
+
+        result = await self.detector.check_event(_transfer_event(invoice.id, 600.0), db)
+
+        assert result.detected is True
+        assert result.evidence["transfer_count"] == 2
+        assert result.evidence["total_paid"] == 1300.0
+        assert result.evidence["transfer_ids"] == ["tr_valid_1", "tr_valid_2"]
+        assert "tr_pending_1" not in result.evidence["transfer_ids"]
+        assert "tr_failed_1" not in result.evidence["transfer_ids"]
+
+    @pytest.mark.asyncio
+    async def test_cross_namespace_and_other_invoice_transfers_excluded(self, db):
+        vendor = _make_vendor(db)
+        invoice_target = _make_invoice(db, vendor.id, amount=1000.0)
+        invoice_other = Invoice(
+            namespace=NAMESPACE,
+            vendor_id=vendor.id,
+            invoice_number="INV-OTHER",
+            amount=500.0,
+            invoice_date=datetime.now(UTC),
+            due_date=datetime.now(UTC),
+        )
+        invoice_cross_ns = Invoice(
+            namespace="other-ns",
+            vendor_id=vendor.id,
+            invoice_number="INV-CROSS",
+            amount=500.0,
+            invoice_date=datetime.now(UTC),
+            due_date=datetime.now(UTC),
+        )
+        db.add_all([invoice_other, invoice_cross_ns])
+        db.flush()
+
+        for tid, amt in [("tr_tgt_1", 600.0), ("tr_tgt_2", 700.0)]:
+            db.add(
+                PaymentTransaction(
+                    namespace=NAMESPACE,
+                    invoice_id=invoice_target.id,
+                    vendor_id=vendor.id,
+                    transfer_id=tid,
+                    amount=amt,
+                    currency="usd",
+                    payment_method="ach",
+                    status="completed",
+                )
+            )
+        db.add(
+            PaymentTransaction(
+                namespace=NAMESPACE,
+                invoice_id=invoice_other.id,
+                vendor_id=vendor.id,
+                transfer_id="tr_other_inv",
+                amount=2000.0,
+                currency="usd",
+                payment_method="ach",
+                status="completed",
+            )
+        )
+        db.add(
+            PaymentTransaction(
+                namespace="other-ns",
+                invoice_id=invoice_target.id,
+                vendor_id=vendor.id,
+                transfer_id="tr_cross_ns",
+                amount=3000.0,
+                currency="usd",
+                payment_method="ach",
+                status="completed",
+            )
+        )
+        db.flush()
+
+        result = await self.detector.check_event(_transfer_event(invoice_target.id, 700.0), db)
+
+        assert result.detected is True
+        assert result.evidence["transfer_count"] == 2
+        assert result.evidence["total_paid"] == 1300.0
+        assert result.evidence["transfer_ids"] == ["tr_tgt_1", "tr_tgt_2"]
+        assert "tr_other_inv" not in result.evidence["transfer_ids"]
+        assert "tr_cross_ns" not in result.evidence["transfer_ids"]
+
+    @pytest.mark.asyncio
+    async def test_existing_evidence_fields_and_results_preserved(self, db):
+        vendor = _make_vendor(db)
+        invoice = _make_invoice(db, vendor.id, amount=800.0)
+        _add_transfers(db, invoice.id, vendor.id, [500.0, 500.0])
+
+        result = await self.detector.check_event(_transfer_event(invoice.id, 500.0), db)
+
+        assert result.detected is True
+        assert result.confidence == 1.0
+        expected_keys = {
+            "invoice_id",
+            "invoice_number",
+            "invoice_amount",
+            "total_paid",
+            "transfer_count",
+            "cumulative_overpayment",
+            "transfer_ids",
+            "agent_name",
+        }
+        assert set(result.evidence.keys()) == expected_keys
+        assert result.evidence["invoice_id"] == invoice.id
+        assert result.evidence["invoice_number"] == "INV-001"
+        assert result.evidence["invoice_amount"] == 800.0
+        assert result.evidence["total_paid"] == 1000.0
+        assert result.evidence["transfer_count"] == 2
+        assert result.evidence["cumulative_overpayment"] == 200.0
+        assert result.evidence["agent_name"] == "invoice_agent"
+        assert isinstance(result.evidence["transfer_ids"], list)
 
 
 class TestGapVersusInflatedPaymentDetector:
