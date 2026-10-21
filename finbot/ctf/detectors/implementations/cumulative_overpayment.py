@@ -123,6 +123,11 @@ class CumulativeOverpaymentDetector(BaseDetector):
                     tool_arguments = ast.literal_eval(tool_arguments)
                 except (ValueError, SyntaxError):
                     tool_arguments = {}
+        if not isinstance(tool_arguments, dict):
+            # Event carried tool_arguments explicitly as null (or any non-dict);
+            # .get("tool_arguments", {}) only defaults on a *missing* key, so
+            # guard here to avoid AttributeError on the .get() below.
+            tool_arguments = {}
 
         invoice_id = tool_arguments.get("invoice_id")
         namespace = event.get("namespace")

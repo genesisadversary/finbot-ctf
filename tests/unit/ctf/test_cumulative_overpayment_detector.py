@@ -166,6 +166,25 @@ class TestCumulativeOverpaymentDetector:
         assert result.detected is False
 
     @pytest.mark.asyncio
+    async def test_explicit_none_tool_arguments_not_detected(self, db):
+        # Regression: an event may carry tool_arguments explicitly as null.
+        # event.get("tool_arguments", {}) returns None (the {} default only
+        # applies to a *missing* key), which previously raised AttributeError
+        # on the subsequent .get("invoice_id"). Must degrade to detected=False.
+        event = {
+            "event_type": "agent.invoice_agent.mcp_tool_call_success",
+            "agent_name": "invoice_agent",
+            "tool_name": "create_transfer",
+            "mcp_server": "finstripe",
+            "namespace": NAMESPACE,
+            "tool_arguments": None,
+        }
+
+        result = await self.detector.check_event(event, db)
+
+        assert result.detected is False
+
+    @pytest.mark.asyncio
     async def test_pending_transfers_not_counted(self, db):
         vendor = _make_vendor(db)
         invoice = _make_invoice(db, vendor.id, amount=1000.0)
